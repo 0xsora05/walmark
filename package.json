@@ -1,0 +1,39 @@
+{
+  "name": "walmark",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Highlight or circle a word in a document, save it to Walrus memory, and recall it later with its page and title.",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test tests/*.test.ts",
+    "test:e2e": "node tests/e2e.cjs",
+    "icons": "node scripts/make-icons.cjs",
+    "postinstall": "node scripts/copy-pdf-worker.mjs",
+    "setup:mainnet": "node scripts/setup-mainnet.mjs",
+    "doctor": "node scripts/doctor.mjs",
+    "test:e2e:sui": "node tests/e2e-sui.cjs",
+    "smoke:sui": "node scripts/smoke-sui.mjs",
+    "test:e2e:learn": "node tests/e2e-learn.cjs"
+  },
+  "dependencies": {
+    "@grpc/grpc-js": "^1.14.7",
+    "@mysten-incubation/memwal": "0.1.12",
+    "@mysten/sui": "2.38.0",
+    "@mysten/walrus": "1.2.37",
+    "@protobuf-ts/grpc-transport": "^2.11.1",
+    "idb": "^8.0.3",
+    "next": "16.4.3",
+    "pdfjs-dist": "5.7.284",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "typescript": "^5.9.0"
+  }
+}

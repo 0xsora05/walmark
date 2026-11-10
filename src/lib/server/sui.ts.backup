@@ -1,0 +1,247 @@
+import { Buffer } from 'node:buffer';
+import { suiEnv } from './env';
+import { SuiBackendError, explainWriteError, formatCoin, parseBlobObject } from './sui-util';
+
+export { SuiBackendError } from './sui-util';
+export type { BlobObjectInfo } from './sui-util';
+
+/**
+ * Direct Sui + Walrus access, server side only.
+ *  - every Sui read goes through the Tatum RPC gateway (`x-api-key` header)
+ *  - writes are signed by the server's own Sui wallet via @mysten/walrus (WAL pays storage, SUI pays gas)
+ */
+
+/* ------------------------------------------------------------------ */
+/* Tatum JSON-RPC                                                      */
+/* ------------------------------------------------------------------ */
+
+export function rpcHeaders(): Record<string, string> {
+  const e = suiEnv();
+  const h: Record<string, string> = { 'content-type': 'application/json' };
+  if (e.tatumKey) h['x-api-key'] = e.tatumKey;
+  return h;
+}
+
+/** One raw JSON-RPC call to the configured Sui node (Tatum by default). */
+export async function rpc<T>(method: string, params: unknown[] = [], ms = 15_000): Promise<T> {
+  const e = suiEnv();
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), ms);
+  try {
+    const res = await fetch(e.rpcUrl, {
+      method: 'POST',
+      headers: rpcHeaders(),
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+      signal: ctrl.signal,
+    });
+    if (res.status === 401 || res.status === 403) throw new SuiBackendError('The Sui RPC rejected the API key (check TATUM_API_KEY).', 502);
+    if (res.status === 429) throw new SuiBackendError('The Sui RPC rate limit was hit. Try again in a moment.', 429);
+    if (!res.ok) throw new SuiBackendError(`The Sui RPC answered HTTP ${res.status}.`);
+    const body = (await res.json()) as { result?: T; error?: { message?: string } };
+    if (body.error) throw new SuiBackendError(`Sui RPC error: ${body.error.message ?? 'unknown'}`);
+    return body.result as T;
+  } catch (err) {
+    if (err instanceof SuiBackendError) throw err;
+    const name = err instanceof Error ? err.name : '';
+    throw new SuiBackendError(name === 'AbortError' ? 'The Sui RPC timed out.' : 'The Sui RPC is unreachable.');
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* Wallet                                                              */
+/* ------------------------------------------------------------------ */
+
+/** Accepts a `suiprivkey1...` string (what Sui wallets export) or a 32-byte hex seed. */
+export async function keypairFrom(secret: string) {
+  const { Ed25519Keypair } = await import('@mysten/sui/keypairs/ed25519');
+  const s = secret.trim();
+  if (/^(0x)?[0-9a-fA-F]{64}$/.test(s)) return Ed25519Keypair.fromSecretKey(Uint8Array.from(Buffer.from(s.replace(/^0x/, ''), 'hex')));
+  if (s.startsWith('suiprivkey')) return Ed25519Keypair.fromSecretKey(s);
+  throw new SuiBackendError('SUI_PRIVATE_KEY must be a suiprivkey1... string or 64 hex characters.', 500);
+}
+
+export async function walletAddress(): Promise<string> {
+  const kp = await keypairFrom(suiEnv().privateKey);
+  return kp.toSuiAddress();
+}
+
+/* ------------------------------------------------------------------ */
+/* Walrus client (SDK) over the Tatum transport                        */
+/* ------------------------------------------------------------------ */
+
+let clientPromise: Promise<unknown> | null = null;
+
+async function walrusClient() {
+  if (!clientPromise) {
+    clientPromise = (async () => {
+      const e = suiEnv();
+      const { SuiJsonRpcClient, JsonRpcHTTPTransport } = await import('@mysten/sui/jsonRpc');
+      const { walrus } = await import('@mysten/walrus');
+      const transport = new JsonRpcHTTPTransport({ url: e.rpcUrl, rpc: { headers: e.tatumKey ? { 'x-api-key': e.tatumKey } : {} } });
+      return new SuiJsonRpcClient({ network: e.network, transport }).$extend(
+        walrus({
+          storageNodeClientOptions: { timeout: 60_000 },
+          ...(e.uploadRelay ? { uploadRelay: { host: e.uploadRelay, timeout: 120_000, sendTip: { max: 5_000_000 } } } : {}),
+        }),
+      );
+    })().catch((err) => {
+      clientPromise = null;
+      throw err;
+    });
+  }
+  return (await clientPromise) as Awaited<ReturnType<typeof buildType>>;
+}
+// Only used to name the client type without importing the SDK at module load.
+async function buildType() {
+  const { SuiJsonRpcClient } = await import('@mysten/sui/jsonRpc');
+  const { walrus } = await import('@mysten/walrus');
+  return new SuiJsonRpcClient({ network: 'mainnet', url: 'http://localhost' }).$extend(walrus());
+}
+
+/* ------------------------------------------------------------------ */
+/* Writing                                                             */
+/* ------------------------------------------------------------------ */
+
+export interface SuiWriteResult {
+  blobId: string;
+  blobObjectId: string;
+  endEpoch?: number;
+  size?: number;
+  address: string;
+  network: string;
+}
+
+// One signer, one gas coin: run writes one after another so transactions do not collide.
+let queue: Promise<unknown> = Promise.resolve();
+let day = '';
+let writesToday = 0;
+
+function countWrite(): void {
+  const today = new Date().toISOString().slice(0, 10);
+  if (today !== day) {
+    day = today;
+    writesToday = 0;
+  }
+  if (writesToday >= suiEnv().maxWritesPerDay) {
+    throw new SuiBackendError(`Daily write limit reached (${suiEnv().maxWritesPerDay}). Raise WALMARK_MAX_WRITES_PER_DAY if this is expected.`, 429);
+  }
+  writesToday++;
+}
+
+export function writeBlob(bytes: Uint8Array, epochs: number): Promise<SuiWriteResult> {
+  const run = async (): Promise<SuiWriteResult> => {
+    countWrite();
+    const e = suiEnv();
+    const signer = await keypairFrom(e.privateKey);
+    const client = await walrusClient();
+    try {
+      const res = await client.walrus.writeBlob({ blob: bytes, deletable: false, epochs, signer });
+      const obj = res.blobObject as { id?: string; size?: string | number; storage?: { end_epoch?: number | string } };
+      return {
+        blobId: res.blobId,
+        blobObjectId: String(obj?.id ?? ''),
+        endEpoch: obj?.storage?.end_epoch !== undefined ? Number(obj.storage.end_epoch) : undefined,
+        size: obj?.size !== undefined ? Number(obj.size) : undefined,
+        address: signer.toSuiAddress(),
+        network: e.network,
+      };
+    } catch (err) {
+      writesToday = Math.max(0, writesToday - 1);
+      throw explainWriteError(err);
+    }
+  };
+  const next = queue.then(run, run);
+  queue = next.catch(() => undefined);
+  return next;
+}
+
+/* ------------------------------------------------------------------ */
+/* Reading chain state (all through Tatum)                             */
+/* ------------------------------------------------------------------ */
+
+interface BalanceRow {
+  coinType: string;
+  totalBalance: string;
+}
+
+export interface WalletStatus {
+  network: string;
+  rpcHost: string;
+  rpcOk: boolean;
+  latencyMs: number;
+  chainId?: string;
+  chainMatches?: boolean;
+  epoch?: number;
+  address?: string;
+  sui?: string;
+  wal?: string;
+  uploadRelay: string | null;
+  estCostWal?: string;
+  error?: string;
+}
+
+export async function walletStatus(epochs: number): Promise<WalletStatus> {
+  const e = suiEnv();
+  const started = Date.now();
+  const out: WalletStatus = {
+    network: e.network,
+    rpcHost: new URL(e.rpcUrl).host,
+    rpcOk: false,
+    latencyMs: 0,
+    uploadRelay: e.uploadRelay ? new URL(e.uploadRelay).host : null,
+  };
+  try {
+    const address = await walletAddress();
+    out.address = address;
+    const [chainId, state, balances] = await Promise.all([
+      rpc<string>('sui_getChainIdentifier'),
+      rpc<{ epoch: string }>('suix_getLatestSuiSystemState'),
+      rpc<BalanceRow[]>('suix_getAllBalances', [address]),
+    ]);
+    out.rpcOk = true;
+    out.chainId = chainId;
+    out.chainMatches = chainId === (e.network === 'mainnet' ? '35834a8a' : '4c78adac');
+    out.epoch = Number(state.epoch);
+    out.sui = formatCoin(balances.find((b) => b.coinType === '0x2::sui::SUI')?.totalBalance ?? '0');
+    out.wal = formatCoin(balances.find((b) => /::wal::WAL$/.test(b.coinType))?.totalBalance ?? '0');
+  } catch (err) {
+    out.error = err instanceof Error ? err.message : 'Could not read the wallet';
+  }
+  out.latencyMs = Date.now() - started;
+
+  if (out.rpcOk) {
+    try {
+      const client = await walrusClient();
+      const c = await client.walrus.storageCost(2048, epochs);
+      out.estCostWal = formatCoin(c.totalCost);
+    } catch {
+      /* the estimate is a nicety; the rest of the status stands without it */
+    }
+  }
+  return out;
+}
+
+/* ------------------------------------------------------------------ */
+/* Verifying a stored blob on chain                                    */
+/* ------------------------------------------------------------------ */
+
+export async function verifyBlobObject(objectId: string, expectedBlobId?: string) {
+  const { blobIdFromInt } = await import('@mysten/walrus');
+  const [raw, state] = await Promise.all([
+    rpc('sui_getObject', [objectId, { showContent: true, showOwner: true, showType: true }]),
+    rpc<{ epoch: string }>('suix_getLatestSuiSystemState'),
+  ]);
+  const info = parseBlobObject(raw, blobIdFromInt);
+  const currentEpoch = Number(state.epoch);
+  const epochsLeft = info.endEpoch !== undefined ? Math.max(0, info.endEpoch - currentEpoch) : undefined;
+  return {
+    ...info,
+    currentEpoch,
+    epochsLeft,
+    matchesBlobId: expectedBlobId && info.blobId ? info.blobId === expectedBlobId : undefined,
+    verified: Boolean(info.exists && info.isWalrusBlob && info.certified && (expectedBlobId ? info.blobId === expectedBlobId : true) && (epochsLeft === undefined || epochsLeft > 0)),
+  };
+}
+
